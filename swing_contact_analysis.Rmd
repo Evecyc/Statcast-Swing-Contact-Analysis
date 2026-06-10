@@ -1,0 +1,358 @@
+---
+title: 'Statcast Swing Mechanics and Contact Quality Analysis'
+output:
+  html_document: default
+  pdf_document: default
+---
+
+##### How does swing path tilt relate to contact quality metrics such as sweet spot probability, hard-hit probability, and expected wOBA?
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#library(baseballr)
+library(tidyverse)
+library(janitor)
+library(ggplot2)
+library(patchwork)
+library(pROC)
+```
+
+### 3.1 Data Selection and Cleaning
+
+The dataset is retrieved from MLB website, containing detailed pitch-by-pitch tracking data, including swing metrics and batted-ball outcomes. For this analysis, we focus on batted-ball events with complete information on swing path tilt, launch characteristics, and pitch location.
+
+```{r}
+get_data <- function(start_date, end_date, season = 2025){
+  url <- glue::glue(
+  "https://baseballsavant.mlb.com/statcast_search/csv?all=true",
+  "&game_date_gt={start_date}&game_date_lt={end_date}",
+  "&player_type=batter&type=details"
+  )
+  readr::read_csv(
+    url,
+    show_col_types = FALSE,
+    guess_max = 200000,
+    col_types = readr::cols(
+      swing_path_tilt                     = readr::col_double(),
+      launch_speed                        = readr::col_double(),
+      launch_angle                        = readr::col_double(),
+      estimated_woba_using_speedangle     = readr::col_double(),
+      plate_z                             = readr::col_double(),
+      sz_bot                              = readr::col_double(),
+      sz_top                              = readr::col_double(),
+      .default = readr::col_character()
+    )
+  ) |>
+    janitor::clean_names()
+}
+
+start  <- as.Date("2024-01-01")
+end    <- as.Date("2025-11-10")
+starts <- seq.Date(start, end, by = "month")
+ends   <- pmin(c(starts[-1] - 1, end), end)
+
+raw <- purrr::map2_dfr(starts, ends, ~ get_data(.x, .y)) |>
+  suppressMessages(readr::type_convert(guess_max = Inf))
+
+dat <-  raw |>
+    dplyr::select(
+      swing_path_tilt,
+      launch_speed, launch_angle,
+      estimated_woba_using_speedangle,
+      plate_z, sz_bot, sz_top
+    ) |>
+    filter(
+      !is.na(swing_path_tilt),
+      !is.na(launch_speed),
+      !is.na(launch_angle),
+      !is.na(estimated_woba_using_speedangle)
+    ) |>
+    mutate(
+      hard_hit = as.integer(launch_speed >= 95),
+      sweet_spot = as.integer(launch_angle >= 8 & launch_angle <= 32)
+    )
+```
+
+### 3.2 **EDA**
+
+#### 3.2.1 Distribution of Key Variables
+
+Descriptive statistics were computed to summarize distributions of swing-related variables and hitting outcomes.
+
+```{r}
+ggplot(dat, aes(x = swing_path_tilt)) +
+  geom_histogram(bins = 30, fill = "pink", color = "white") +
+  labs(title = "Distribution of Swing Path Tilt", x = "Swing Path Tilt (°)", y = "Count")
+
+ggplot(dat, aes(x = estimated_woba_using_speedangle)) +
+  geom_histogram(bins = 30, fill = "tomato", color = "white") +
+  labs(title = "Distribution of Expected wOBA", x = "xwOBA", y = "Count")
+
+mean(dat$hard_hit)
+
+mean(dat$sweet_spot)
+```
+
+#### 3.2.2 Swing Path Tilt vs. Contact Quality Outcomes
+
+Exploratory visualizations were generated to examine the empirical relationship between swing path tilt and three key outcome measures:
+
+-   *Sweet Spot Rate* (probability of 8° ≤ launch angle ≤ 32°)
+
+-   *Hard–Hit Rate* (probability of exit velocity ≥ 95 mph)
+
+-   *Expected wOBA* (continuous measure of expected batting value)
+
+Each metric was plotted against binned swing path tilt values to illustrate potential nonlinearity.
+
+The observed parabolic trends suggest that hitting performance improves with moderate tilt angles (roughly 35–45°) and declines when the swing plane becomes too steep or too flat.
+
+```{r}
+quick_EDA <- function(){
+  dat_bin <- dat |>
+  mutate(tilt_bin = cut(
+    swing_path_tilt,
+    breaks = c(-Inf, 15, 20, 25, 30, 35, 40, 45, 50, Inf),
+    right = TRUE,
+    include.lowest = TRUE,
+    labels = c("<15", "(15,20]", "(20,25]", "(25,30]", "(30,35]", "(35,40]", "(40,45]", "(45,50]", ">50")
+  ))
+  
+  # Sweet Spot
+  p1 <- dat_bin |>
+    group_by(tilt_bin) |>
+    summarise(p = mean(sweet_spot), .groups="drop") |>
+    ggplot(aes(tilt_bin, p)) +
+    geom_col(fill="gold") +
+    geom_text(aes(label=scales::percent(p, accuracy = 1)), vjust=-0.5, color="black", size=2) +
+    scale_y_continuous(labels=scales::percent_format(accuracy = 1), limits=c(0,0.55)) +
+    labs(x="Swing Path Tilt (°)", y="P(Sweet Spot)", 
+         title="Sweet Spot Rate by Tilt") +
+    theme(axis.text.x = element_text(angle=45, hjust=1))
+  
+  # Hard-Hit
+  p2 <- dat_bin |>
+    group_by(tilt_bin) |>
+    summarise(p = mean(hard_hit), .groups="drop") |>
+    ggplot(aes(tilt_bin, p)) +
+    geom_col(fill="lightgreen") +
+    geom_text(aes(label=scales::percent(p, accuracy = 1)), vjust=-0.5, color="black", size=2) +
+    scale_y_continuous(labels=scales::percent_format(accuracy = 1), limits=c(0,0.55)) +
+    labs(x="Swing Path Tilt (°)", y="P(Hard-Hit)", 
+         title="Hard-Hit Rate by Tilt") +
+    theme(axis.text.x = element_text(angle=45, hjust=1))
+  
+  # xwOBA
+  p3 <- dat_bin |>
+    group_by(tilt_bin) |>
+    summarise(xwoba = mean(estimated_woba_using_speedangle, na.rm = TRUE), .groups="drop") |>
+    ggplot(aes(tilt_bin, xwoba)) +
+    geom_col(fill="lightblue") +
+    geom_text(aes(label=round(xwoba, 3)), vjust=-0.5, color="black", size=2) +
+    scale_y_continuous(limits=c(0,0.5)) +
+    labs(x="Swing Path Tilt (°)", y="Mean xwOBA", 
+         title="Expected wOBA by Tilt") +
+    theme(axis.text.x = element_text(angle=45, hjust=1))
+  
+  (p1 | p2 | p3) + plot_layout(widths = c(1,1,1))
+}
+quick_EDA()
+```
+
+### 3.3 Models
+
+Three models were built to evaluate how swing path tilt affects contact quality — both alone and interacting with pitch height (Low, Mid, High).
+
+Each outcome (*Sweet Spot*, *Hard–Hit*, *Expected wOBA*) was modeled twice: first with tilt only, then with the interaction term to test whether the effect changes across pitch levels.
+
+```{r}
+dat <- dat |>
+  mutate(rel_plate_z = (plate_z - sz_bot) / pmax(1e-6, (sz_top - sz_bot))) |>
+  mutate(plate_z_bin = cut(rel_plate_z, breaks = c(-Inf, 0.3, 0.7, Inf),
+                           labels = c("Low","Mid","High")))
+
+pred_ci <- function(mod, newdata){
+  if (inherits(mod, "glm")) {
+    p <- predict(mod, newdata, se.fit = TRUE, type = "link")
+    fit <- plogis(p$fit); lwr <- plogis(p$fit - 1.96*p$se.fit); upr <- plogis(p$fit + 1.96*p$se.fit)
+  } else {
+    p <- predict(mod, newdata, se.fit = TRUE)
+    fit <- as.numeric(p$fit); lwr <- fit - 1.96*p$se.fit; upr <- fit + 1.96*p$se.fit
+  }
+  cbind(newdata, fit, lwr, upr) |> as_tibble()
+}
+
+nd_tilt   <- tibble(swing_path_tilt = seq(10, 65, 1))
+nd_tilt_z <- crossing(
+  swing_path_tilt = seq(10, 65, 1),
+  plate_z_bin = fct_relevel(dat$plate_z_bin, "Low","Mid","High")
+)
+```
+
+#### 3.3.1 Sweet Spot Rate
+
+Without pitch height, Sweet Spot probability followed a parabolic trend, peaking near 50°.
+
+Adding pitch height revealed that the optimal tilt shifts by zone:
+
+-   **Low pitches**: probability climbs from low tilt to high tilt.
+
+-   **Mid pitches**: inverted-U shape, peaking around 40°.
+
+-   **High pitches**: similar to Mid, with smoother line.
+
+```{r}
+m_sweet <- glm(sweet_spot ~ swing_path_tilt + I(swing_path_tilt^2),
+                family = binomial, data = dat)
+
+m_sweet_z <- glm(sweet_spot ~ swing_path_tilt*plate_z_bin + I(swing_path_tilt^2)*plate_z_bin,
+                 family = binomial, data = dat)
+
+pred_ci(m_sweet, nd_tilt) |>
+  ggplot(aes(swing_path_tilt, fit)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), fill="grey80", alpha=.4) +
+  geom_line(linewidth=1) +
+  scale_y_continuous(labels=scales::percent) +
+  labs(title="Swing Tilt × Sweet Spot", x="Swing Path Tilt (°)", y="P(Sweet Spot)")
+
+pred_ci(m_sweet_z, nd_tilt_z) |>
+  ggplot(aes(swing_path_tilt, fit, color=plate_z_bin, fill=plate_z_bin)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), alpha=.2, colour=NA) +
+  geom_line(linewidth=1) +
+  scale_y_continuous(labels=scales::percent) +
+  labs(title="P(Sweet Spot) vs Tilt by Pitch Height", x="Swing Path Tilt (°)", y="Predicted Probability", color="Height", fill="Height")
+```
+
+#### 3.3.2 Hard-Hit Rate
+
+The baseline model shows an inverted-U pattern between tilt and Hard–Hit probability.
+
+After adding pitch height, zone differences became clear:
+
+-   **Low pitches**: benefit from higher tilt.
+
+-   **Mid pitches**: strongest effect around 30° tilt.
+
+-   **High pitches**: performance drops at steep angles.
+
+```{r}
+m_hard <- glm(hard_hit ~ swing_path_tilt + I(swing_path_tilt^2),
+              family = binomial, data = dat)
+
+m_hard_z  <- glm(hard_hit ~ swing_path_tilt*plate_z_bin + I(swing_path_tilt^2)*plate_z_bin,
+                 family = binomial, data = dat)
+
+pred_ci(m_hard, nd_tilt) |>
+  ggplot(aes(swing_path_tilt, fit)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), fill="grey80", alpha=.4) +
+  geom_line(linewidth=1) +
+  scale_y_continuous(labels=scales::percent) +
+  labs(title="P(Hard-Hit) vs Swing Path Tilt", x="Swing Path Tilt (°)", y="P(Hard-Hit)")
+
+pred_ci(m_hard_z, nd_tilt_z) |>
+  ggplot(aes(swing_path_tilt, fit, color=plate_z_bin, fill=plate_z_bin)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), alpha=.2, colour=NA) +
+  geom_line(linewidth=1) +
+  scale_y_continuous(labels=scales::percent) +
+  labs(title="P(Hard-Hit) vs Tilt by Pitch Height", x="Swing Path Tilt (°)", y="Predicted Probability", color="Height", fill="Height")
+```
+
+#### 3.3.3 Expected wOBA
+
+The tilt-only model shows a mild rise then decline beyond 50°.
+
+-   **Low pitches:** steadily increases with tilt and peaks near 50°, suggesting uppercut swings are most productive when attacking low pitches.
+
+-   **Mid pitches:** follows a clear inverted-U pattern with an optimal tilt around 40°, producing the highest expected contact quality overall.
+
+-   **High pitches:** performance declines with increasing tilt, indicating flatter swing paths are better for high-zone contact.
+
+```{r}
+m_woba <- lm(estimated_woba_using_speedangle ~ swing_path_tilt + I(swing_path_tilt^2),
+              data = dat)
+
+m_woba_z  <- lm(estimated_woba_using_speedangle ~ swing_path_tilt*plate_z_bin + I(swing_path_tilt^2)*plate_z_bin, data = dat)
+
+pred_ci(m_woba, nd_tilt) |>
+  ggplot(aes(swing_path_tilt, fit)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), fill="grey80", alpha=.4) +
+  geom_line(linewidth=1) +
+  labs(title="Swing Tilt × Expected wOBA", x="Swing Path Tilt (°)", y="Predicted xwOBA")
+
+pred_ci(m_woba_z, nd_tilt_z) |>
+  ggplot(aes(swing_path_tilt, fit, color=plate_z_bin, fill=plate_z_bin)) +
+  geom_ribbon(aes(ymin=lwr, ymax=upr), alpha=.2, colour=NA) +
+  geom_line(linewidth=1) +
+  labs(title="xwOBA vs Tilt by Pitch Height", x="Swing Path Tilt (°)", y="Predicted xwOBA", color="Height", fill="Height")
+```
+
+### 3.4 Evaluation
+
+Model quality was assessed using Pseudo R², AUC, R², and RMSE.
+
+Adding pitch height slightly improved predictive accuracy across outcomes, particularly AUC and RMSE.
+
+Though overall explanatory power remains modest (expected for Statcast data), the consistent direction across models supports that swing–pitch interaction meaningfully shapes contact quality.
+
+```{r}
+model_key <- function(m) paste(class(m)[1], deparse(stats::formula(m)), collapse = " ")
+
+glm_truth_pred <- function(m) {
+  mf <- stats::model.frame(m)                     
+  y  <- stats::model.response(mf)
+  p  <- stats::predict(m, type = "response")      
+  y  <- if (is.logical(y)) as.integer(y) else
+        if (is.factor(y)) as.integer(y) - 1 else as.numeric(y)
+  tibble(truth = y, .pred = p) |> tidyr::drop_na()
+}
+
+auc_pROC <- function(truth, pred) {
+  if (length(unique(truth)) < 2) return(NA_real_)
+  if (sd(pred) == 0) return(NA_real_)
+  out <- tryCatch({
+    pROC::auc(truth, pred, quiet = TRUE)
+  }, error = function(e) NA_real_)
+  as.numeric(out)
+}
+
+evaluate_models <- function(...) {
+  ms   <- list(...)
+  keys <- vapply(ms, model_key, character(1))
+  ms   <- ms[!duplicated(keys)]
+  keys <- keys[!duplicated(keys)]
+
+  map2_dfr(ms, keys, function(m, key) {
+    typ <- class(m)[1]
+    if (typ == "glm") {
+      pr2 <- 1 - (m$deviance / m$null.deviance)
+      df  <- glm_truth_pred(m)
+      auc_val <- auc_pROC(df$truth, df$.pred)
+      tibble(Model = key, Type = typ,
+             R2 = NA_real_, RMSE = NA_real_,
+             PseudoR2 = pr2, AUC = auc_val)
+    } else { # lm
+      r2   <- summary(m)$r.squared
+      rmse <- sqrt(mean(residuals(m)^2))
+      tibble(Model = key, Type = typ,
+             R2 = r2, RMSE = rmse,
+             PseudoR2 = NA_real_, AUC = NA_real_)
+    }
+  })
+}
+
+evaluate_models(m_sweet, m_sweet_z, m_hard, m_hard_z, m_woba, m_woba_z)
+```
+
+### 3.5 Conclusion
+
+This study examined how swing path tilt influences three indicators of hitting quality — *Sweet Spot Rate*, *Hard–Hit Rate*, and *Expected wOBA* — and how this relationship varies with pitch height.
+
+Across all models, the results consistently show a nonlinear (parabolic) trend, with optimal performance occurring at moderate swing tilt angles (approximately 35–45°).
+
+When pitch height is incorporated, clear interaction effects emerge: mid-zone pitches benefit most from these moderate tilt angles, while low and high pitches require adaptive adjustments in swing plane for optimal contact.
+
+Although the models exhibit modest explanatory power (a typical feature of Statcast-level variance), the consistent directional patterns support the biomechanical principle that effective hitting depends on matching swing trajectory to pitch location.
+
+These findings highlight the importance of dynamic swing adjustment and offer quantitative evidence linking swing mechanics to batted-ball outcomes.
+
+Future work could extend this analysis by incorporating pitch type, spin rate, and batter–pitcher handedness to further contextualize how hitters optimize their mechanics against varying pitch profiles.
